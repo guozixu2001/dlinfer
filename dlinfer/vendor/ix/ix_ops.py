@@ -7,6 +7,10 @@ from dlinfer.vendor import vendor_ops_registry
 from dlinfer.utils.registry import register_ops
 from dlinfer.utils.type_annotation import Tensor, Optional, Sequence, Tuple
 
+from vllm.attention.ops.prefix_prefill import context_attention_fwd
+from vllm.model_executor.layers.fused_moe import fused_experts
+from vllm import _custom_ops as custom_ops
+
 import ixformer.inference.functions as ops
 import ixformer.functions as ix_func
 from ixformer.contrib.vllm_flash_attn import (
@@ -210,7 +214,35 @@ def paged_prefill_attention(
     kv_zeros: Optional[Tensor],
     quant_bits: Optional[int],
 ) -> Tensor:
-    raise NotImplementedError("Not implemented on ix.")
+    if softmax_scale is None:
+        softmax_scale = float(1 / math.sqrt(query.size(-1)))
+    
+    kv_cache_dtype = "auto"
+    if quant_bits == 8 and kv_scales is not None:
+        kv_cache_dtype = "fp8_e4m3"
+    
+    output = torch.empty_like(query) if attn_output is None else attn_output
+    context_lens = kv_seq_len - q_seq_len
+    
+    value_cache = value_cache.permute(0, 1, 3, 2)
+    context_attention_fwd(
+        query,
+        key,
+        value,
+        output,
+        kv_cache_dtype,
+        key_cache,
+        value_cache,
+        b_loc=block_table,
+        b_start_loc=q_start_loc,
+        b_seq_len=kv_seq_len,
+        b_ctx_len=context_lens,
+        max_input_len=max_q_seq_len,
+        # k_scale=k_scale,
+        # v_scale=v_scale,
+        alibi_slopes=alibi_slopes,
+    )
+    return output
 
 
 @register_ops(vendor_ops_registry)
@@ -233,7 +265,30 @@ def rms_norm(
 def moe_gating_topk_softmax(
     router_logits: Tensor, topk: int, renormalize: bool = False
 ) -> Tuple[Tensor, Tensor]:
-    raise NotImplementedError("Not implemented on ix.")
+    N = router_logits.size(0)
+
+    topk_weights = torch.empty(
+        N, topk, dtype=torch.float32, device=router_logits.device
+    )
+    topk_ids = torch.empty(N, topk, dtype=torch.int32, device=router_logits.device)
+
+    token_expert_indicies = torch.empty_like(topk_ids)
+
+    ix_func.vllm_moe_topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        router_logits.float(),
+    )
+
+    del token_expert_indicies  # Not used. Will be used in the future.
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_weights = topk_weights.view(-1)
+    topk_ids = topk_ids.view(-1)
+
+    return topk_weights, topk_ids
 
 
 @register_ops(vendor_ops_registry)
@@ -256,7 +311,14 @@ def fused_moe(
     top_k: int,
     renormalize: bool,
 ) -> Tensor:
-    raise NotImplementedError("Not implemented on ix.")
+    N = hidden_states.size(0)
+    topk_weights = topk_weights.reshape(N, top_k)
+    topk_ids = topk_ids.reshape(N, top_k)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return fused_experts(
+        hidden_states, gate_up_weights, down_weights, topk_weights, topk_ids
+    )
 
 
 @register_ops(vendor_ops_registry)
@@ -289,14 +351,21 @@ def weight_quant_matmul(
     all_reduce: Optional[bool] = False,
     group_size: Optional[int] = 0,
 ):
-    raise NotImplementedError("Not implemented on ix.")
+    offset = None if (offset is None or offset.numel() == 0) else offset
+    output = custom_ops.awq_gemm(x, qweight, scale, offset, group_size)
+    if bias is not None:
+        output += bias
+    return output
 
 
 @register_ops(vendor_ops_registry)
 def dynamic_quant(
     x: Tensor, quant_dtype: torch.dtype, quant_granularity: str = "PER_TOKEN"
 ):
-    raise NotImplementedError("Not implemented on ix.")
+    assert quant_dtype == torch.int8
+    assert quant_granularity == "PER_TOKEN"
+    x, input_scale, _ = custom_ops.scaled_int8_quant(x, None)
+    return x, input_scale
 
 
 @register_ops(vendor_ops_registry)
@@ -309,7 +378,18 @@ def linear_w8a8(
     quant_dtype: torch.dtype = torch.int8,
     bias: Tensor = None,
 ):
-    raise NotImplementedError("Not implemented on ix.")
+    assert quant_dtype == torch.int8
+    bs, seq_len, head_size = a.size()
+    out = custom_ops.cutlass_scaled_mm(
+        a.view(-1, head_size),
+        b,
+        scale_a=rms_scale,
+        scale_b=linear_scale,
+        out_dtype=out_dtype,
+        bias=bias,
+    )
+    out = out.view(bs, seq_len, -1)
+    return out
 
 
 @register_ops(vendor_ops_registry)
@@ -319,7 +399,11 @@ def rms_norm_w8a8(
     epsilon: float,
     quant_dtype: torch.dtype = torch.int8,
 ):
-    raise NotImplementedError("Not implemented on ix.")
+    assert quant_dtype == torch.int8
+    x = torch.empty_like(hidden_states)
+    custom_ops.rms_norm(x, hidden_states, weight, epsilon)
+    x, input_scale, _ = custom_ops.scaled_int8_quant(x, None)
+    return x, input_scale
 
 
 @register_ops(vendor_ops_registry)
@@ -330,4 +414,7 @@ def add_rms_norm_w8a8(
     epsilon: float,
     quant_dtype: torch.dtype = torch.int8,
 ):
-    raise NotImplementedError("Not implemented on ix.")
+    assert quant_dtype == torch.int8
+    custom_ops.fused_add_rms_norm(hidden_states, residual, weight, epsilon)
+    x, input_scale, _ = vllm._custom_ops.scaled_int8_quant(hidden_states, None)
+    return x, input_scale, residual
