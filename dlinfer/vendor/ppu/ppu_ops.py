@@ -13,6 +13,7 @@ from vllm import _custom_ops as custom_ops
 from vllm.model_executor.layers.fused_moe import fused_experts
 from vllm.attention.ops.prefix_prefill import context_attention_fwd
 from vllm.vllm_flash_attn import flash_attn_varlen_func
+from vllm.attention.utils.fa_utils import get_flash_attn_version
 # from vllm.attention.ops.flashmla import (flash_mla_with_kvcache,
 #                                          get_mla_metadata,
 #                                          is_flashmla_supported)
@@ -280,26 +281,50 @@ def paged_decode_attention(
         )
         return attn_output.view(batch_size, num_q_heads, 512)
 
-    custom_ops.paged_attention_v1(
-        output,
-        query,
-        key_cache,
-        value_cache,
-        num_kv_heads,
-        softmax_scale,
-        block_table,
-        kv_seq_len,
-        block_size,
-        max_kv_seq_len,
-        None,
-        "auto",
-        kv_scale,
-        kv_scale,
-        tp_rank,
-        0,
-        0,
-        64,
-        0,
+    # Reshape K cache to match flash_attn_varlen_func's expectations
+    # Original: (num_blocks, num_kv_heads, head_size/x, block_size, x)
+    # Target: (num_blocks, block_size, num_kv_heads, head_size)
+    d0, d1, d2, d3, d4 = key_cache.shape
+    k_cache_permuted = key_cache.permute(0, 3, 1, 2, 4)
+    k_cache_reshaped = k_cache_permuted.contiguous().view(d0, d3, d1, d2 * d4)
+
+    # Reshape V cache
+    # Original: (num_blocks, num_kv_heads, head_size, block_size)
+    # Target: (num_blocks, block_size, num_kv_heads, head_size)
+    v_cache_reshaped = value_cache.permute(0, 3, 1, 2).contiguous()
+
+    batch_size = block_table.size(0)
+    cu_seqlens_q = torch.arange(
+        0, batch_size + 1, device=query.device, dtype=torch.int32
+    )
+    
+    vllm_flash_attn_version = get_flash_attn_version()
+    if vllm_flash_attn_version is None:
+        raise RuntimeError("FlashAttention version could not be determined.")
+    
+    flash_attn_varlen_func(
+        q=query,
+        k=k_cache_reshaped,
+        v=v_cache_reshaped,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=1,  # Decode has query length 1
+        seqused_k=kv_seq_len,
+        max_seqlen_k=max_kv_seq_len,
+        softmax_scale=softmax_scale,
+        causal=True,
+        alibi_slopes=None,
+        window_size=list((-1, -1)),
+        block_table=block_table,
+        softcap=0.0,
+        scheduler_metadata=None,
+        fa_version=vllm_flash_attn_version,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        num_prefill=-1,
+        max_seqlen_k_decode=0,
+        max_seqlen_k_prefill=0,
     )
     return output
 
